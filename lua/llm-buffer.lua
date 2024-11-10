@@ -1,9 +1,49 @@
+---@class LLMBufferConfig
+---@field window_width number Width of the floating window (0-1)
+---@field window_height number Height of the floating window (0-1)
+---@field anthropic_api_key string|nil API key for Anthropic
+---@field openai_api_key string|nil API key for OpenAI
+---@field provider "anthropic"|"openai"|"ollama" The LLM provider to use
+---@field model string The model to use for completion
+---@field system_prompt string The system prompt to use
+---@field mappings LLMBufferMappings Key mappings configuration
+
+---@class LLMBufferMappings
+---@field send_prompt string Keymap to send the prompt
+---@field close_window string Keymap to close the window
+---@field toggle_window string Keymap to toggle the window
+
 local M = {}
 local Job = require("plenary.job")
+
 local active_job = nil
 local llm_buf = nil
 local llm_win = nil
 local was_cancelled = false
+
+-- Configuration
+---@type LLMBufferConfig
+M.defaults = {
+	window_width = 0.9,
+	window_height = 0.9,
+	anthropic_api_key = os.getenv("ANTHROPIC_API_KEY"),
+	openai_api_key = os.getenv("OPENAI_API_KEY"),
+	provider = "anthropic", -- "anthropic" or "openai" or "ollama"
+	model = "claude-3-5-sonnet-latest", -- "claude-3-5-sonnet-latest" or "claude-3-5-haiku-latest" or "gpt-4o-mini"
+	system_prompt = [[
+    You are a helpful assistant. You are an expert in the field of computer science and software development.
+    You have a deep understanding of the topic and are able to provide accurate and helpful information.
+    You currently reside inside a Markdown file buffer in neovim - use proper markdown syntax to answer the user's question. 
+    Any code examples should be formatted in markdown as well.
+    Be concise and to the point.
+    If you don't know the answer, just say that you don't know, don't try to make up an answer.
+  ]],
+	mappings = {
+		send_prompt = "<C-l>",
+		close_window = "q",
+		toggle_window = "<leader>llm",
+	},
+}
 
 local function get_visual_selection()
 	local _, srow, scol = unpack(vim.fn.getpos("v"))
@@ -37,6 +77,7 @@ local function get_visual_selection()
 	end
 end
 
+---@param str string
 local function write_to_buffer(str)
 	vim.schedule(function()
 		local current_window = vim.api.nvim_get_current_win()
@@ -54,28 +95,9 @@ local function write_to_buffer(str)
 	end)
 end
 
--- Configuration
-M.defaults = {
-	window_width = 0.8,
-	window_height = 0.8,
-	anthropic_api_key = os.getenv("ANTHROPIC_API_KEY"),
-	model = "claude-3-5-sonnet-20241022",
-	system_prompt = [[
-    You are a helpful assistant. You are an expert in the field of computer science and software development.
-    You have a deep understanding of the topic and are able to provide accurate and helpful information.
-    You currently reside inside a Markdown file buffer in neovim - use proper markdown syntax to answer the user's question. 
-    Any code examples should be formatted in markdown as well.
-    Be concise and to the point.
-    If you don't know the answer, just say that you don't know, don't try to make up an answer.
-  ]],
-	mappings = {
-		send_prompt = "<C-l>",
-		close_window = "q",
-		toggle_window = "<leader>llm",
-	},
-}
-
 -- Create the floating window
+---@return number buf
+---@return number win
 local function create_floating_window()
 	local width = math.floor(vim.o.columns * M.config.window_width)
 	local height = math.floor(vim.o.lines * M.config.window_height)
@@ -132,63 +154,10 @@ local function create_floating_window()
 	return buf, win
 end
 
--- Function to stream response from Anthropic API
-local function stream_anthropic_response(prompt)
-	-- Ensure we have an API key
-	if not M.config.anthropic_api_key then
-		vim.notify("Anthropic API key not set. Please set it in your Neovim config file.", vim.log.levels.ERROR)
-		return
-	end
-
-	-- Create request body
-	local body = {
-		system = M.config.system_prompt,
-		messages = {
-			{
-				role = "user",
-				content = prompt,
-			},
-		},
-		model = M.config.model,
-		max_tokens = 2000,
-		stream = true,
-	}
-
-	-- Make the request
-	local args = {
-		"-N",
-		"-X",
-		"POST",
-		"-H",
-		"Content-Type: application/json",
-		"-H",
-		"x-api-key: " .. M.config.anthropic_api_key,
-		"-H",
-		"anthropic-version: 2023-06-01",
-		"-d",
-		vim.fn.json_encode(body),
-		"https://api.anthropic.com/v1/messages",
-	}
-
-	-- Parse response
-	local c_event = nil
-	local function parse_response_line(line)
-		local event = line:match("^event: (.+)$")
-		if event then
-			c_event = event
-			return
-		end
-		local data = line:match("^data: (.+)$")
-		if data then
-			if c_event == "content_block_delta" then
-				local json = vim.json.decode(data)
-				if json.delta and json.delta.text then
-					write_to_buffer(json.delta.text)
-				end
-			end
-		end
-	end
-
+-- API Request + Job Handling
+---@param args table # The arguments to pass to curl
+---@param handle_fn function # The function to handle the response
+local function make_api_request(args, handle_fn)
 	if active_job then
 		active_job:shutdown()
 		active_job = nil
@@ -201,10 +170,19 @@ local function stream_anthropic_response(prompt)
 			vim.notify("LLM Request Started", vim.log.levels.DEBUG)
 		end,
 		on_stdout = function(_, out)
-			parse_response_line(out)
+			handle_fn(out)
 		end,
 		on_stderr = function(_, _) end,
-		on_exit = function(_, code)
+		on_exit = function(j, code)
+			-- Check if the job result was valid JSON and if it contains an error message
+			local success, json = pcall(vim.json.decode, table.concat(j:result(), "\n"))
+			if success and json.error then
+				vim.notify("API Error: " .. json.error.message, vim.log.levels.ERROR)
+				active_job = nil
+				was_cancelled = false
+				return
+			end
+
 			-- If the job was cancelled, don't log anything
 			if was_cancelled == false then
 				if code ~= 0 then
@@ -253,6 +231,122 @@ local function stream_anthropic_response(prompt)
 			end
 		end, { buffer = llm_buf, noremap = true, silent = true })
 	end
+end
+
+-- Fuction to stream response from OpenAI API
+---@param prompt string
+local function stream_openai_response(prompt)
+	-- Ensure we have an API key
+	if not M.config.openai_api_key then
+		vim.notify("OpenAI API key not set.", vim.log.levels.ERROR)
+		return
+	end
+
+	local body = {
+		model = M.config.model,
+		messages = {
+			{
+				role = "system",
+				content = M.config.system_prompt,
+			},
+			{
+				role = "user",
+				content = prompt,
+			},
+		},
+		max_tokens = 2000,
+		stream = true,
+	}
+
+	local args = {
+		"-N",
+		"-X",
+		"POST",
+		"-H",
+		"Content-Type: application/json",
+		"-H",
+		"Authorization: Bearer " .. M.config.openai_api_key,
+		"-d",
+		vim.fn.json_encode(body),
+		"https://api.openai.com/v1/chat/completions",
+	}
+
+	local function parse_response(line)
+		if line:match("^data: %[DONE%]$") then
+			return
+		end
+
+		local data = line:match("^data: (.+)$")
+		if data then
+			local success, json = pcall(vim.json.decode, data)
+			if success and json.choices and json.choices[1].delta.content then
+				write_to_buffer(json.choices[1].delta.content)
+			end
+		end
+	end
+
+	make_api_request(args, parse_response)
+end
+
+-- Function to stream response from Anthropic API
+---@param prompt string
+local function stream_anthropic_response(prompt)
+	-- Ensure we have an API key
+	if not M.config.anthropic_api_key then
+		vim.notify("Anthropic API key not set.", vim.log.levels.ERROR)
+		return
+	end
+
+	-- Create request body
+	local body = {
+		system = M.config.system_prompt,
+		messages = {
+			{
+				role = "user",
+				content = prompt,
+			},
+		},
+		model = M.config.model,
+		max_tokens = 2000,
+		stream = true,
+	}
+
+	-- Make the request
+	local args = {
+		"-N",
+		"-X",
+		"POST",
+		"-H",
+		"Content-Type: application/json",
+		"-H",
+		"x-api-key: " .. M.config.anthropic_api_key,
+		"-H",
+		"anthropic-version: 2023-06-01",
+		"-d",
+		vim.fn.json_encode(body),
+		"https://api.anthropic.com/v1/messages",
+	}
+
+	-- Parse response
+	local c_event = nil
+	local function parse_response(line)
+		local event = line:match("^event: (.+)$")
+		if event then
+			c_event = event
+			return
+		end
+		local data = line:match("^data: (.+)$")
+		if data then
+			if c_event == "content_block_delta" then
+				local json = vim.json.decode(data)
+				if json.delta and json.delta.text then
+					write_to_buffer(json.delta.text)
+				end
+			end
+		end
+	end
+
+	make_api_request(args, parse_response)
 end
 
 function M.toggle_window()
@@ -315,13 +409,21 @@ function M.send_prompt()
 
 	if prompt and prompt ~= "" then
 		write_to_buffer("\n\n")
-		stream_anthropic_response(prompt)
+		if M.config.provider == "anthropic" then
+			stream_anthropic_response(prompt)
+		elseif M.config.provider == "openai" then
+			stream_openai_response(prompt)
+		elseif M.config.provider == "ollama" then
+			vim.notify("Ollama is not yet supported.", vim.log.levels.ERROR)
+			-- stream_ollama_response(prompt)
+		end
 	else
 		vim.notify("No prompt found. Ensure you have a valid selection or line selected.", vim.log.levels.ERROR)
 	end
 end
 
 -- Setup function to create keymaps
+---@param opts? LLMBufferConfig
 function M.setup(opts)
 	M.config = vim.tbl_deep_extend("force", M.defaults, opts or {})
 

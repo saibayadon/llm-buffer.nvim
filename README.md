@@ -1,7 +1,7 @@
 # LLMBuffer
 
 A Neovim plugin that provides a floating window interface for
-interacting with Anthropic's Claude AI Model.
+interacting LLM models like Claude, GPT-4, and more.
 
 https://github.com/user-attachments/assets/6d8e064b-2f3f-415c-be1a-131696456569
 
@@ -14,9 +14,8 @@ https://github.com/user-attachments/assets/6d8e064b-2f3f-415c-be1a-131696456569
 
 - Floating window interface with markdown support
 - Visual selection support for prompts
-- Streaming responses from Claude
+- Streaming responses from different LLM providers
 - Configurable window dimensions and keybindings
-- Automatic session cleanup
 
 ## Installation
 
@@ -45,7 +44,9 @@ export ANTHROPIC_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 require("llm-buffer").setup({
     window_width = 0.8, -- Width as percentage of editor width
     window_height = 0.8, -- Height as percentage of editor height
-    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY"), -- Your Anthropic API key
+    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY"),
+    openai_api_key = os.getenv("OPENAI_API_KEY"),
+    provider = "anthropic", -- "anthropic" or "openai" or "ollama"
     model = "claude-3-5-sonnet-20241022", -- Claude model to use
     mappings = {
       send_prompt = "<C-l>",
