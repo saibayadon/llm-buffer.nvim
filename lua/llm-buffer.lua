@@ -1,17 +1,18 @@
 ---@class LLMBufferConfig
----@field window_width number Width of the floating window (0-1)
----@field window_height number Height of the floating window (0-1)
----@field anthropic_api_key string|nil API key for Anthropic
----@field openai_api_key string|nil API key for OpenAI
----@field provider "anthropic"|"openai"|"ollama" The LLM provider to use
----@field model string The model to use for completion
----@field system_prompt string The system prompt to use
----@field mappings LLMBufferMappings Key mappings configuration
+---@field window_width? number Width of the floating window (0-1)
+---@field window_height? number Height of the floating window (0-1)
+---@field anthropic_api_key? string|nil API key for Anthropic
+---@field ollama_api_host? string|nil API host for Ollama
+---@field openai_api_key? string|nil API key for OpenAI
+---@field provider? "anthropic"|"openai"|"ollama" The LLM provider to use
+---@field model? string The model to use for completion
+---@field system_prompt? string The system prompt to use
+---@field mappings? LLMBufferMappings Key mappings configuration
 
 ---@class LLMBufferMappings
----@field send_prompt string Keymap to send the prompt
----@field close_window string Keymap to close the window
----@field toggle_window string Keymap to toggle the window
+---@field send_prompt? string Keymap to send the prompt
+---@field close_window? string Keymap to close the window
+---@field toggle_window? string Keymap to toggle the window
 
 local M = {}
 local Job = require("plenary.job")
@@ -28,6 +29,7 @@ M.defaults = {
 	window_height = 0.9,
 	anthropic_api_key = os.getenv("ANTHROPIC_API_KEY"),
 	openai_api_key = os.getenv("OPENAI_API_KEY"),
+	ollama_api_host = "http://localhost:11434",
 	provider = "anthropic", -- "anthropic" or "openai" or "ollama"
 	model = "claude-3-5-sonnet-latest", -- "claude-3-5-sonnet-latest" or "claude-3-5-haiku-latest" or "gpt-4o-mini"
 	system_prompt = [[
@@ -44,6 +46,13 @@ M.defaults = {
 		toggle_window = "<leader>llm",
 	},
 }
+
+-- Buffer window options
+local win_width
+local win_height
+local win_row
+local win_col
+local win_opts
 
 local function get_visual_selection()
 	local _, srow, scol = unpack(vim.fn.getpos("v"))
@@ -99,21 +108,6 @@ end
 ---@return number buf
 ---@return number win
 local function create_floating_window()
-	local width = math.floor(vim.o.columns * M.config.window_width)
-	local height = math.floor(vim.o.lines * M.config.window_height)
-	local row = math.floor((vim.o.lines - height) / 2)
-	local col = math.floor((vim.o.columns - width) / 2)
-
-	local opts = {
-		relative = "editor",
-		style = "minimal",
-		row = row,
-		col = col,
-		width = width,
-		height = height,
-		border = "rounded",
-	}
-
 	local buf = vim.api.nvim_create_buf(false, true)
 
 	vim.bo[buf].bufhidden = "hide"
@@ -121,7 +115,7 @@ local function create_floating_window()
 	vim.bo[buf].modifiable = true
 	vim.bo[buf].filetype = "markdown"
 
-	local win = vim.api.nvim_open_win(buf, true, opts)
+	local win = vim.api.nvim_open_win(buf, true, win_opts)
 
 	-- Set window options
 	vim.wo[win].wrap = true
@@ -167,7 +161,7 @@ local function make_api_request(args, handle_fn)
 		command = "curl",
 		args = args,
 		on_start = function()
-			vim.notify("LLM Request Started", vim.log.levels.DEBUG)
+			vim.notify("LLM Request Started - " .. M.config.provider, vim.log.levels.DEBUG)
 		end,
 		on_stdout = function(_, out)
 			handle_fn(out)
@@ -177,7 +171,11 @@ local function make_api_request(args, handle_fn)
 			-- Check if the job result was valid JSON and if it contains an error message
 			local success, json = pcall(vim.json.decode, table.concat(j:result(), "\n"))
 			if success and json.error then
-				vim.notify("API Error: " .. json.error.message, vim.log.levels.ERROR)
+				if json.error.message then
+					vim.notify("API Error: " .. json.error.message, vim.log.levels.ERROR)
+				else
+					vim.notify("API Error: " .. json.error, vim.log.levels.ERROR)
+				end
 				active_job = nil
 				was_cancelled = false
 				return
@@ -349,6 +347,40 @@ local function stream_anthropic_response(prompt)
 	make_api_request(args, parse_response)
 end
 
+-- Function to stream response from Ollama API
+---@param prompt string
+local function stream_ollama_response(prompt)
+	-- Create request body
+	local body = {
+		model = M.config.model,
+		prompt = prompt,
+		system = M.config.system_prompt,
+		stream = true,
+	}
+
+	-- Make the request
+	local args = {
+		"-N",
+		"-X",
+		"POST",
+		"-H",
+		"Content-Type: application/json",
+		"-d",
+		vim.fn.json_encode(body),
+		M.config.ollama_api_host .. "/api/generate",
+	}
+
+	-- Parse response
+	local function parse_response(line)
+		local success, json = pcall(vim.json.decode, line)
+		if success and json.response then
+			write_to_buffer(json.response)
+		end
+	end
+
+	make_api_request(args, parse_response)
+end
+
 function M.toggle_window()
 	if not llm_buf or not vim.api.nvim_buf_is_valid(llm_buf) then
 		create_floating_window()
@@ -366,22 +398,7 @@ function M.toggle_window()
 	end
 
 	if not is_visible then
-		local width = math.floor(vim.o.columns * M.config.window_width)
-		local height = math.floor(vim.o.lines * M.config.window_height)
-		local row = math.floor((vim.o.lines - height) / 2)
-		local col = math.floor((vim.o.columns - width) / 2)
-
-		local opts = {
-			relative = "editor",
-			style = "minimal",
-			row = row,
-			col = col,
-			width = width,
-			height = height,
-			border = "rounded",
-		}
-
-		llm_win = vim.api.nvim_open_win(llm_buf, true, opts)
+		llm_win = vim.api.nvim_open_win(llm_buf, true, win_opts)
 		vim.wo[llm_win].wrap = true
 		vim.wo[llm_win].cursorline = true
 	end
@@ -407,18 +424,23 @@ function M.send_prompt()
 	local last_line_length = #vim.api.nvim_buf_get_lines(0, last_line - 1, last_line, false)[1]
 	vim.api.nvim_win_set_cursor(0, { last_line, last_line_length })
 
-	if prompt and prompt ~= "" then
-		write_to_buffer("\n\n")
-		if M.config.provider == "anthropic" then
-			stream_anthropic_response(prompt)
-		elseif M.config.provider == "openai" then
-			stream_openai_response(prompt)
-		elseif M.config.provider == "ollama" then
-			vim.notify("Ollama is not yet supported.", vim.log.levels.ERROR)
-			-- stream_ollama_response(prompt)
+	local success, err = pcall(function()
+		if prompt and prompt ~= "" then
+			write_to_buffer("\n\n")
+			if M.config.provider == "anthropic" then
+				stream_anthropic_response(prompt)
+			elseif M.config.provider == "openai" then
+				stream_openai_response(prompt)
+			elseif M.config.provider == "ollama" then
+				stream_ollama_response(prompt)
+			end
+		else
+			vim.notify("No prompt found. Ensure you have a valid selection or line selected.", vim.log.levels.ERROR)
 		end
-	else
-		vim.notify("No prompt found. Ensure you have a valid selection or line selected.", vim.log.levels.ERROR)
+	end)
+
+	if not success then
+		vim.notify("Error processing request: " .. tostring(err), vim.log.levels.ERROR)
 	end
 end
 
@@ -426,6 +448,22 @@ end
 ---@param opts? LLMBufferConfig
 function M.setup(opts)
 	M.config = vim.tbl_deep_extend("force", M.defaults, opts or {})
+
+	-- Set window options
+	win_width = math.floor(vim.o.columns * M.config.window_width)
+	win_height = math.floor(vim.o.lines * M.config.window_height)
+	win_row = math.floor((vim.o.lines - win_height) / 2)
+	win_col = math.floor((vim.o.columns - win_width) / 2)
+
+	win_opts = {
+		relative = "editor",
+		style = "minimal",
+		row = win_row,
+		col = win_col,
+		width = win_width,
+		height = win_height,
+		border = "rounded",
+	}
 
 	-- Create the LLMBuffer command
 	vim.api.nvim_create_user_command("LLMBuffer", function()
@@ -445,6 +483,15 @@ function M.setup(opts)
 			end
 		end,
 	})
+end
+
+-- Function to update options during runtime
+---@param opts? LLMBufferConfig
+function M.update_options(opts)
+	if opts then
+		M.config = vim.tbl_deep_extend("force", M.defaults, opts)
+		vim.notify("LLMBuffer Provider updated: " .. M.config.provider, vim.log.levels.INFO)
+	end
 end
 
 return M
