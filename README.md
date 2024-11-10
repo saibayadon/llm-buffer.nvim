@@ -3,8 +3,12 @@
 A Neovim plugin that provides a floating window interface for
 interacting with Anthropic's Claude AI Model.
 
+https://github.com/user-attachments/assets/6d8e064b-2f3f-415c-be1a-131696456569
+
 > [!WARNING]  
 > This project is for personal use and in active development. Use at your own risk!
+>
+> The code may also be questionable since this is my first time dabbling in lua and plugin development 😅
 
 ## Features
 
@@ -21,6 +25,7 @@ Using [lazy.nvim](https://github.com/folke/lazy.nvim):
 ```lua
 return {
     "saibayadon/llm-buffer.nvim",
+    dependencies = { "nvim-lua/plenary.nvim" },
     name = "llm-buffer.nvim",
     config = function()
       require("llm-buffer").setup()
