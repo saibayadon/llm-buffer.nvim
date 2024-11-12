@@ -25,8 +25,8 @@ local was_cancelled = false
 -- Configuration
 ---@type LLMBufferConfig
 M.defaults = {
-	window_width = 0.9,
-	window_height = 0.9,
+	window_width = 0.85,
+	window_height = 0.85,
 	anthropic_api_key = os.getenv("ANTHROPIC_API_KEY"),
 	openai_api_key = os.getenv("OPENAI_API_KEY"),
 	ollama_api_host = "http://localhost:11434",
@@ -114,6 +114,11 @@ local function create_floating_window()
 	vim.bo[buf].swapfile = false
 	vim.bo[buf].modifiable = true
 	vim.bo[buf].filetype = "markdown"
+
+	vim.api.nvim_set_hl(0, "FloatTitle", {
+		fg = "Orange", -- Change text color (white here)
+		bg = "#31353f", -- Change background color (dark gray here)
+	})
 
 	local win = vim.api.nvim_open_win(buf, true, win_opts)
 
@@ -383,7 +388,11 @@ end
 
 function M.toggle_window()
 	if not llm_buf or not vim.api.nvim_buf_is_valid(llm_buf) then
+		local lines = get_visual_selection()
 		create_floating_window()
+		if lines then
+			write_to_buffer(table.concat(lines, "\n"))
+		end
 		return
 	end
 
@@ -458,6 +467,10 @@ function M.setup(opts)
 	win_opts = {
 		relative = "editor",
 		style = "minimal",
+		title = "  llm-buffer.nvim  ",
+		title_pos = "center",
+		footer = "  " .. M.config.provider .. "/" .. M.config.model .. "  ",
+		footer_pos = "center",
 		row = win_row,
 		col = win_col,
 		width = win_width,
@@ -471,7 +484,7 @@ function M.setup(opts)
 	end, {})
 
 	-- Set up the global keybinding
-	vim.keymap.set("n", M.config.mappings.toggle_window, function()
+	vim.keymap.set({ "n", "v" }, M.config.mappings.toggle_window, function()
 		M.toggle_window()
 	end, { noremap = true, silent = true, desc = "Toggle LLM Buffer" })
 
