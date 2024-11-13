@@ -2,9 +2,10 @@
 ---@field window_width? number Width of the floating window (0-1)
 ---@field window_height? number Height of the floating window (0-1)
 ---@field anthropic_api_key? string|nil API key for Anthropic
+---@field gemini_api_key? string|nil API key for Gemini
 ---@field ollama_api_host? string|nil API host for Ollama
 ---@field openai_api_key? string|nil API key for OpenAI
----@field provider? "anthropic"|"openai"|"ollama" The LLM provider to use
+---@field provider? "anthropic"|"gemini"|"openai"|"ollama" The LLM provider to use
 ---@field model? string The model to use for completion
 ---@field system_prompt? string The system prompt to use
 ---@field mappings? LLMBufferMappings Key mappings configuration
@@ -29,9 +30,10 @@ M.defaults = {
 	window_height = 0.85,
 	anthropic_api_key = os.getenv("ANTHROPIC_API_KEY"),
 	openai_api_key = os.getenv("OPENAI_API_KEY"),
+	gemini_api_key = os.getenv("GEMINI_API_KEY"),
 	ollama_api_host = "http://localhost:11434",
-	provider = "anthropic", -- "anthropic" or "openai" or "ollama"
-	model = "claude-3-5-sonnet-latest", -- "claude-3-5-sonnet-latest" or "claude-3-5-haiku-latest" or "gpt-4o-mini"
+	provider = "anthropic", -- "anthropic", "gemini", "openai" or "ollama"
+	model = "claude-3-5-sonnet-latest", -- "claude-3-5-sonnet-latest", "gemini-1.5-pro" or "gpt-4o-mini"
 	system_prompt = [[
     You are a helpful assistant. You are an expert in the field of computer science and software development.
     You have a deep understanding of the topic and are able to provide accurate and helpful information.
@@ -367,6 +369,55 @@ local function stream_anthropic_response(prompt)
 	make_api_request(args, parse_response)
 end
 
+-- Function to stream from Gemini API
+---@param prompt string
+local function stream_gemini_response(prompt)
+	-- Ensure we have an API key
+	if not M.config.gemini_api_key then
+		vim.notify("Gemini API key not set.", vim.log.levels.ERROR)
+		return
+	end
+
+	local body = {
+		contents = {
+			parts = {
+				text = "This are your instructions: "
+					.. M.config.system_prompt
+					.. "\n And this is the user prompt: "
+					.. prompt,
+			},
+		},
+	}
+
+	-- Make the request
+	local args = {
+		"-N",
+		"-X",
+		"POST",
+		"-H",
+		"Content-Type: application/json",
+		"-d",
+		vim.fn.json_encode(body),
+		"https://generativelanguage.googleapis.com/v1beta/models/"
+			.. M.config.model
+			.. ":streamGenerateContent?alt=sse&key="
+			.. M.config.gemini_api_key,
+	}
+
+	-- Parse response
+	local function parse_response(line)
+		local data = line:match("^data: (.+)$")
+		if data then
+			local json = vim.json.decode(data)
+			if json.candidates and json.candidates[1].content then
+				write_to_buffer(json.candidates[1].content.parts[1].text)
+			end
+		end
+	end
+
+	make_api_request(args, parse_response)
+end
+
 -- Function to stream response from Ollama API
 ---@param prompt string
 local function stream_ollama_response(prompt)
@@ -463,6 +514,8 @@ function M.send_prompt()
 				stream_anthropic_response(prompt)
 			elseif M.config.provider == "openai" then
 				stream_openai_response(prompt)
+			elseif M.config.provider == "gemini" then
+				stream_gemini_response(prompt)
 			elseif M.config.provider == "ollama" then
 				stream_ollama_response(prompt)
 			end
