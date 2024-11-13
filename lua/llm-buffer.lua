@@ -14,7 +14,7 @@
 ---@field close_window? string Keymap to close the window
 ---@field toggle_window? string Keymap to toggle the window
 
-local M = {}
+local M = { win_opts = {} }
 local Job = require("plenary.job")
 
 local active_job = nil
@@ -52,7 +52,6 @@ local win_width
 local win_height
 local win_row
 local win_col
-local win_opts
 
 local function get_visual_selection()
 	local _, srow, scol = unpack(vim.fn.getpos("v"))
@@ -104,6 +103,13 @@ local function write_to_buffer(str)
 	end)
 end
 
+function M.close_window()
+	if llm_win and vim.api.nvim_win_is_valid(llm_win) then
+		vim.api.nvim_win_close(llm_win, true)
+		llm_win = nil
+	end
+end
+
 -- Create the floating window
 ---@return number buf
 ---@return number win
@@ -120,7 +126,7 @@ local function create_floating_window()
 		bg = "#31353f", -- Change background color (dark gray here)
 	})
 
-	local win = vim.api.nvim_open_win(buf, true, win_opts)
+	local win = vim.api.nvim_open_win(buf, true, M.win_opts)
 
 	-- Set window options
 	vim.wo[win].wrap = true
@@ -146,7 +152,7 @@ local function create_floating_window()
 		buf,
 		"n",
 		M.config.mappings.close_window,
-		[[<cmd>lua vim.api.nvim_win_close(0, true)<CR>]],
+		[[<cmd>lua require('llm-buffer').close_window()<CR>]],
 		{ noremap = true, silent = true }
 	)
 
@@ -157,83 +163,92 @@ end
 ---@param args table # The arguments to pass to curl
 ---@param handle_fn function # The function to handle the response
 local function make_api_request(args, handle_fn)
-	if active_job then
-		active_job:shutdown()
+	local function handle_error(err)
+		vim.notify("API Error: " .. (err or "Unknown error"), vim.log.levels.ERROR)
 		active_job = nil
+		was_cancelled = false
 	end
 
-	active_job = Job:new({
-		command = "curl",
-		args = args,
-		on_start = function()
-			vim.notify("LLM Request Started - " .. M.config.provider, vim.log.levels.DEBUG)
-		end,
-		on_stdout = function(_, out)
-			handle_fn(out)
-		end,
-		on_stderr = function(_, _) end,
-		on_exit = function(j, code)
-			-- Check if the job result was valid JSON and if it contains an error message
-			local success, json = pcall(vim.json.decode, table.concat(j:result(), "\n"))
-			if success and json.error then
-				if json.error.message then
-					vim.notify("API Error: " .. json.error.message, vim.log.levels.ERROR)
+	-- Handle any unexpected errors when making the API request
+	pcall(function()
+		if active_job then
+			active_job:shutdown()
+			active_job = nil
+		end
+
+		active_job = Job:new({
+			command = "curl",
+			args = args,
+			on_start = function()
+				vim.notify("LLM Request Started - " .. M.config.provider, vim.log.levels.DEBUG)
+			end,
+			on_stdout = function(_, out)
+				handle_fn(out)
+			end,
+			on_stderr = function(_, _) end,
+			on_exit = function(j, code)
+				-- Check if the job result was valid JSON and if it contains an error message
+				local success, json = pcall(vim.json.decode, table.concat(j:result(), "\n"))
+				if success and json.error then
+					if json.error.message then
+						vim.notify("API Error: " .. json.error.message, vim.log.levels.ERROR)
+					else
+						vim.notify("API Error: " .. json.error, vim.log.levels.ERROR)
+					end
+					active_job = nil
+					was_cancelled = false
+					return
+				end
+
+				-- If the job was cancelled, don't log anything
+				if was_cancelled == false then
+					if code ~= 0 then
+						vim.notify("LLM Request Failed", vim.log.levels.ERROR)
+					else
+						vim.notify("LLM Request Completed", vim.log.levels.INFO)
+					end
 				else
-					vim.notify("API Error: " .. json.error, vim.log.levels.ERROR)
+					vim.notify("LLM Request Cancelled", vim.log.levels.INFO)
 				end
 				active_job = nil
 				was_cancelled = false
-				return
-			end
+			end,
+		})
 
-			-- If the job was cancelled, don't log anything
-			if was_cancelled == false then
-				if code ~= 0 then
-					vim.notify("LLM Request Failed", vim.log.levels.ERROR)
-				else
-					vim.notify("LLM Request Completed", vim.log.levels.INFO)
+		active_job:start()
+
+		-- Cancel the job if the user closes the window
+		vim.api.nvim_create_autocmd("BufLeave", {
+			buffer = llm_buf,
+			callback = function()
+				if active_job then
+					was_cancelled = true
+					active_job:shutdown()
+					active_job = nil
 				end
-			else
-				vim.notify("LLM Request Cancelled", vim.log.levels.INFO)
-			end
-			active_job = nil
-			was_cancelled = false
-		end,
-	})
+			end,
+		})
 
-	active_job:start()
-
-	-- Cancel the job if the user closes the window
-	vim.api.nvim_create_autocmd("BufLeave", {
-		buffer = llm_buf,
-		callback = function()
-			if active_job then
-				was_cancelled = true
-				active_job:shutdown()
-				active_job = nil
-			end
-		end,
-	})
-
-	-- Cancel the job if the user presses <Esc> in any mode
-	local modes = { "n", "i", "v", "x" }
-	for _, mode in ipairs(modes) do
-		vim.keymap.set(mode, "<Esc>", function()
-			if active_job then
-				was_cancelled = true
-				active_job:shutdown()
-				active_job = nil
-			end
-			-- Exit insert mode if we're in it
-			if mode == "i" then
-				vim.cmd("stopinsert")
-			end
-			-- Clear visual selection if in visual mode
-			if mode == "v" or mode == "x" then
-				vim.cmd("normal! <Esc>")
-			end
-		end, { buffer = llm_buf, noremap = true, silent = true })
-	end
+		-- Cancel the job if the user presses <Esc> in any mode
+		local modes = { "n", "i", "v", "x" }
+		for _, mode in ipairs(modes) do
+			vim.keymap.set(mode, "<Esc>", function()
+				if active_job then
+					was_cancelled = true
+					active_job:shutdown()
+					active_job = nil
+				end
+				-- Exit insert mode if we're in it
+				if mode == "i" then
+					vim.cmd("stopinsert")
+				end
+				-- Clear visual selection if in visual mode
+				if mode == "v" or mode == "x" then
+					vim.cmd("normal! <Esc>")
+				end
+			end, { buffer = llm_buf, noremap = true, silent = true })
+		end
+	end, handle_error)
 end
 
 -- Fuction to stream response from OpenAI API
@@ -387,6 +402,7 @@ local function stream_ollama_response(prompt)
 end
 
 function M.toggle_window()
+	-- If there's no buffer or window, create them
 	if not llm_buf or not vim.api.nvim_buf_is_valid(llm_buf) then
 		local lines = get_visual_selection()
 		create_floating_window()
@@ -396,20 +412,27 @@ function M.toggle_window()
 		return
 	end
 
-	local wins = vim.api.nvim_list_wins()
-	local is_visible = false
-	for _, win in ipairs(wins) do
-		if vim.api.nvim_win_get_buf(win) == llm_buf then
-			vim.api.nvim_win_close(win, true)
-			is_visible = true
-			break
-		end
-	end
+	-- If the buffer window is open, close it otherwise create a new one
+	if llm_buf and llm_win and vim.api.nvim_buf_is_valid(llm_buf) then
+		vim.api.nvim_win_close(llm_win, true)
+		llm_win = nil
+	else
+		local lines = get_visual_selection()
 
-	if not is_visible then
-		llm_win = vim.api.nvim_open_win(llm_buf, true, win_opts)
+		-- Show the window
+		llm_win = vim.api.nvim_open_win(llm_buf, true, M.win_opts)
 		vim.wo[llm_win].wrap = true
 		vim.wo[llm_win].cursorline = true
+
+		if lines then
+			-- Move to the end of the buffer
+			local last_line = vim.api.nvim_buf_line_count(0)
+			local last_line_length = #vim.api.nvim_buf_get_lines(0, last_line - 1, last_line, false)[1]
+			vim.api.nvim_win_set_cursor(0, { last_line, last_line_length })
+			-- Write the visual selection to the end of the buffer
+			write_to_buffer("\n")
+			write_to_buffer(table.concat(lines, "\n"))
+		end
 	end
 end
 
@@ -464,7 +487,7 @@ function M.setup(opts)
 	win_row = math.floor((vim.o.lines - win_height) / 2)
 	win_col = math.floor((vim.o.columns - win_width) / 2)
 
-	win_opts = {
+	M.win_opts = {
 		relative = "editor",
 		style = "minimal",
 		title = "  llm-buffer.nvim  ",
@@ -502,7 +525,22 @@ end
 ---@param opts? LLMBufferConfig
 function M.update_options(opts)
 	if opts then
+		-- Update the configuration
 		M.config = vim.tbl_deep_extend("force", M.defaults, opts)
+
+		-- Update the window footer to show the new provider and model
+		M.win_opts = vim.tbl_deep_extend("force", M.win_opts, {
+			footer = "  " .. M.config.provider .. "/" .. M.config.model .. "  ",
+		})
+
+		-- If the window is visible, update the footer
+		if llm_win and vim.api.nvim_win_is_valid(llm_win) then
+			vim.api.nvim_win_set_config(llm_win, {
+				footer = "  " .. M.config.provider .. "/" .. M.config.model .. "  ",
+				footer_pos = "center",
+			})
+		end
+
 		vim.notify("LLMBuffer Provider updated: " .. M.config.provider, vim.log.levels.INFO)
 	end
 end
