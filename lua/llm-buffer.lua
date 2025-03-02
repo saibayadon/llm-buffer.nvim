@@ -22,8 +22,9 @@ local active_job = nil
 local llm_buf = nil
 local llm_win = nil
 local was_cancelled = false
+local conversation_history = {}
+local MAX_HISTORY_MESSAGES = 10
 
--- Configuration
 ---@type LLMBufferConfig
 M.defaults = {
 	window_width = 0.85,
@@ -33,14 +34,21 @@ M.defaults = {
 	gemini_api_key = os.getenv("GEMINI_API_KEY"),
 	ollama_api_host = "http://localhost:11434",
 	provider = "anthropic", -- "anthropic", "gemini", "openai" or "ollama"
-	model = "claude-3-5-sonnet-latest", -- "claude-3-5-sonnet-latest", "gemini-1.5-pro" or "gpt-4o-mini"
+	model = "claude-3-7-sonnet-latest", -- "claude-3-7-sonnet-latest", "gemini-2.0-flash" or "gpt-4o-mini"
 	system_prompt = [[
-    You are a helpful assistant. You are an expert in the field of computer science and software development.
-    You have a deep understanding of the topic and are able to provide accurate and helpful information.
-    You currently reside inside a Markdown file buffer in neovim - use proper markdown syntax to answer the user's question. 
-    Any code examples should be formatted in markdown as well.
-    Be concise and to the point.
-    If you don't know the answer, just say that you don't know, don't try to make up an answer.
+    You are a helpful AI coding assistant with expertise in computer science and software development.
+
+    ## Guidelines:
+    - Format your responses using proper Markdown syntax
+    - Use syntax-highlighted code blocks with language identifiers (```python, ```lua, etc.)
+    - Be concise and direct in your explanations
+    - Provide practical, working examples when appropriate
+    - When showing code, prioritize readability and best practices
+    - If you're uncertain about something, acknowledge it rather than guessing
+    - When explaining concepts, use clear structure with headings and lists
+
+    Remember that you're responding within a Neovim buffer, so your Markdown formatting will be rendered properly.
+    Focus on providing actionable solutions that the developer can implement immediately.
   ]],
 	mappings = {
 		send_prompt = "<C-l>",
@@ -49,7 +57,6 @@ M.defaults = {
 	},
 }
 
--- Buffer window options
 local win_width
 local win_height
 local win_row
@@ -90,18 +97,23 @@ end
 ---@param str string
 local function write_to_buffer(str)
 	vim.schedule(function()
-		local current_window = vim.api.nvim_get_current_win()
-		local cursor_position = vim.api.nvim_win_get_cursor(current_window)
-		local row, col = cursor_position[1], cursor_position[2]
-
 		local lines = vim.split(str, "\n")
+		local last_line = vim.api.nvim_buf_line_count(0)
+
+		local last_line_content = vim.api.nvim_buf_get_lines(0, last_line - 1, last_line, false)[1]
+
+		local new_lines = { last_line_content .. lines[1] }
+
+		for i = 2, #lines do
+			table.insert(new_lines, lines[i])
+		end
 
 		vim.cmd("undojoin")
-		vim.api.nvim_put(lines, "c", true, true)
 
-		local num_lines = #lines
-		local last_line_length = #lines[num_lines]
-		vim.api.nvim_win_set_cursor(current_window, { row + num_lines - 1, col + last_line_length })
+		vim.api.nvim_buf_set_lines(0, last_line - 1, last_line, false, new_lines)
+
+		local new_last_line = vim.api.nvim_buf_line_count(0)
+		vim.api.nvim_win_set_cursor(0, { new_last_line, 0 })
 	end)
 end
 
@@ -112,13 +124,13 @@ function M.close_window()
 	end
 end
 
--- Create the floating window
 ---@return number buf
 ---@return number win
 local function create_floating_window()
 	local buf = vim.api.nvim_create_buf(false, true)
 
 	vim.bo[buf].bufhidden = "hide"
+	vim.bo[buf].buflisted = false
 	vim.bo[buf].swapfile = false
 	vim.bo[buf].modifiable = true
 	vim.bo[buf].filetype = "markdown"
@@ -130,7 +142,6 @@ local function create_floating_window()
 
 	local win = vim.api.nvim_open_win(buf, true, M.win_opts)
 
-	-- Set window options
 	vim.wo[win].wrap = true
 
 	llm_buf = buf
@@ -141,27 +152,35 @@ local function create_floating_window()
 		"n",
 		M.config.mappings.send_prompt,
 		[[<cmd>lua require('llm-buffer').send_prompt()<CR>]],
-		{ noremap = true, silent = true }
+		{
+			noremap = true,
+			silent = true,
+		}
 	)
 	vim.api.nvim_buf_set_keymap(
 		buf,
 		"v",
 		M.config.mappings.send_prompt,
 		[[<cmd>lua require('llm-buffer').send_prompt()<CR>]],
-		{ noremap = true, silent = true }
+		{
+			noremap = true,
+			silent = true,
+		}
 	)
 	vim.api.nvim_buf_set_keymap(
 		buf,
 		"n",
 		M.config.mappings.close_window,
 		[[<cmd>lua require('llm-buffer').close_window()<CR>]],
-		{ noremap = true, silent = true }
+		{
+			noremap = true,
+			silent = true,
+		}
 	)
 
 	return buf, win
 end
 
--- API Request + Job Handling
 ---@param args table # The arguments to pass to curl
 ---@param handle_fn function # The function to handle the response
 local function make_api_request(args, handle_fn)
@@ -208,6 +227,20 @@ local function make_api_request(args, handle_fn)
 						vim.notify("LLM Request Failed", vim.log.levels.ERROR)
 					else
 						vim.notify("LLM Request Completed", vim.log.levels.INFO)
+
+						-- Add a new line after the response and place cursor there
+						vim.schedule(function()
+							if llm_buf and vim.api.nvim_buf_is_valid(llm_buf) then
+								local last_line = vim.api.nvim_buf_line_count(llm_buf)
+								local last_line_content =
+									vim.api.nvim_buf_get_lines(llm_buf, last_line - 1, last_line, false)[1]
+
+								if last_line_content and #last_line_content > 0 then
+									vim.api.nvim_buf_set_lines(llm_buf, last_line, last_line, false, { "", "" })
+									vim.api.nvim_win_set_cursor(0, { last_line + 2, 0 })
+								end
+							end
+						end)
 					end
 				else
 					vim.notify("LLM Request Cancelled", vim.log.levels.INFO)
@@ -248,19 +281,52 @@ local function make_api_request(args, handle_fn)
 				if mode == "v" or mode == "x" then
 					vim.cmd("normal! <Esc>")
 				end
-			end, { buffer = llm_buf, noremap = true, silent = true })
+			end, {
+				buffer = llm_buf,
+				noremap = true,
+				silent = true,
+			})
 		end
 	end, handle_error)
 end
 
--- Fuction to stream response from OpenAI API
+---@param text string
+---@return number
+local function estimate_token_count(text)
+	return math.ceil(#text / 4)
+end
+
+---@return string
+local function build_context_from_history()
+	if #conversation_history == 0 then
+		return ""
+	end
+
+	local start_idx = math.max(1, #conversation_history - MAX_HISTORY_MESSAGES + 1)
+	local context = "<previous_context>\n"
+
+	for i = start_idx, #conversation_history do
+		local entry = conversation_history[i]
+		if entry.role == "prompt" then
+			context = context .. "<prompt>\n" .. entry.content .. "\n</prompt>\n\n"
+		elseif entry.role == "response" then
+			context = context .. "<response>\n" .. entry.content .. "\n</response>\n\n"
+		end
+	end
+	context = context .. "</previous_context>\n\n"
+
+	return context
+end
+
 ---@param prompt string
-local function stream_openai_response(prompt)
-	-- Ensure we have an API key
+---@param collect_fn function Function to collect the response
+local function stream_openai_response(prompt, collect_fn)
 	if not M.config.openai_api_key then
 		vim.notify("OpenAI API key not set.", vim.log.levels.ERROR)
 		return
 	end
+
+	local context = build_context_from_history()
 
 	local body = {
 		model = M.config.model,
@@ -271,7 +337,7 @@ local function stream_openai_response(prompt)
 			},
 			{
 				role = "user",
-				content = prompt,
+				content = context .. prompt,
 			},
 		},
 		max_tokens = 2000,
@@ -299,8 +365,8 @@ local function stream_openai_response(prompt)
 		local data = line:match("^data: (.+)$")
 		if data then
 			local success, json = pcall(vim.json.decode, data)
-			if success and json.choices and json.choices[1].delta.content then
-				write_to_buffer(json.choices[1].delta.content)
+			if success and json.choices and json.choices[1].delta and json.choices[1].delta.content then
+				collect_fn(json.choices[1].delta.content)
 			end
 		end
 	end
@@ -308,30 +374,27 @@ local function stream_openai_response(prompt)
 	make_api_request(args, parse_response)
 end
 
--- Function to stream response from Anthropic API
 ---@param prompt string
-local function stream_anthropic_response(prompt)
-	-- Ensure we have an API key
+---@param collect_fn function Function to collect the response
+local function stream_anthropic_response(prompt, collect_fn)
 	if not M.config.anthropic_api_key then
 		vim.notify("Anthropic API key not set.", vim.log.levels.ERROR)
 		return
 	end
 
-	-- Create request body
+	local context = build_context_from_history()
+
 	local body = {
 		system = M.config.system_prompt,
-		messages = {
-			{
-				role = "user",
-				content = prompt,
-			},
-		},
+		messages = { {
+			role = "user",
+			content = context .. prompt,
+		} },
 		model = M.config.model,
 		max_tokens = 2000,
 		stream = true,
 	}
 
-	-- Make the request
 	local args = {
 		"-N",
 		"-X",
@@ -347,7 +410,6 @@ local function stream_anthropic_response(prompt)
 		"https://api.anthropic.com/v1/messages",
 	}
 
-	-- Parse response
 	local c_event = nil
 	local function parse_response(line)
 		local event = line:match("^event: (.+)$")
@@ -358,9 +420,9 @@ local function stream_anthropic_response(prompt)
 		local data = line:match("^data: (.+)$")
 		if data then
 			if c_event == "content_block_delta" then
-				local json = vim.json.decode(data)
-				if json.delta and json.delta.text then
-					write_to_buffer(json.delta.text)
+				local success, json = pcall(vim.json.decode, data)
+				if success and json.delta and json.delta.text then
+					collect_fn(json.delta.text)
 				end
 			end
 		end
@@ -369,14 +431,15 @@ local function stream_anthropic_response(prompt)
 	make_api_request(args, parse_response)
 end
 
--- Function to stream from Gemini API
 ---@param prompt string
-local function stream_gemini_response(prompt)
-	-- Ensure we have an API key
+---@param collect_fn function Function to collect the response
+local function stream_gemini_response(prompt, collect_fn)
 	if not M.config.gemini_api_key then
 		vim.notify("Gemini API key not set.", vim.log.levels.ERROR)
 		return
 	end
+
+	local context = build_context_from_history()
 
 	local body = {
 		contents = {
@@ -384,6 +447,7 @@ local function stream_gemini_response(prompt)
 				text = "This are your instructions: "
 					.. M.config.system_prompt
 					.. "\n And this is the user prompt: "
+					.. context
 					.. prompt,
 			},
 		},
@@ -404,13 +468,12 @@ local function stream_gemini_response(prompt)
 			.. M.config.gemini_api_key,
 	}
 
-	-- Parse response
 	local function parse_response(line)
 		local data = line:match("^data: (.+)$")
 		if data then
-			local json = vim.json.decode(data)
-			if json.candidates and json.candidates[1].content then
-				write_to_buffer(json.candidates[1].content.parts[1].text)
+			local success, json = pcall(vim.json.decode, data)
+			if success and json.candidates and json.candidates[1] and json.candidates[1].content then
+				collect_fn(json.candidates[1].content.parts[1].text)
 			end
 		end
 	end
@@ -418,13 +481,16 @@ local function stream_gemini_response(prompt)
 	make_api_request(args, parse_response)
 end
 
--- Function to stream response from Ollama API
 ---@param prompt string
-local function stream_ollama_response(prompt)
+---@param collect_fn function Function to collect the response
+local function stream_ollama_response(prompt, collect_fn)
+	-- Build the context from conversation history
+	local context = build_context_from_history()
+
 	-- Create request body
 	local body = {
 		model = M.config.model,
-		prompt = prompt,
+		prompt = context .. prompt,
 		system = M.config.system_prompt,
 		stream = true,
 	}
@@ -444,8 +510,8 @@ local function stream_ollama_response(prompt)
 	-- Parse response
 	local function parse_response(line)
 		local success, json = pcall(vim.json.decode, line)
-		if success and json.response then
-			write_to_buffer(json.response)
+		if success and json and json.response then
+			collect_fn(json.response)
 		end
 	end
 
@@ -453,7 +519,6 @@ local function stream_ollama_response(prompt)
 end
 
 function M.toggle_window()
-	-- If there's no buffer or window, create them
 	if not llm_buf or not vim.api.nvim_buf_is_valid(llm_buf) then
 		local lines = get_visual_selection()
 		create_floating_window()
@@ -463,24 +528,21 @@ function M.toggle_window()
 		return
 	end
 
-	-- If the buffer window is open, close it otherwise create a new one
 	if llm_buf and llm_win and vim.api.nvim_buf_is_valid(llm_buf) then
 		vim.api.nvim_win_close(llm_win, true)
 		llm_win = nil
 	else
 		local lines = get_visual_selection()
 
-		-- Show the window
 		llm_win = vim.api.nvim_open_win(llm_buf, true, M.win_opts)
 		vim.wo[llm_win].wrap = true
 		vim.wo[llm_win].cursorline = true
 
 		if lines then
-			-- Move to the end of the buffer
 			local last_line = vim.api.nvim_buf_line_count(0)
 			local last_line_length = #vim.api.nvim_buf_get_lines(0, last_line - 1, last_line, false)[1]
 			vim.api.nvim_win_set_cursor(0, { last_line, last_line_length })
-			-- Write the visual selection to the end of the buffer
+
 			write_to_buffer("\n")
 			write_to_buffer(table.concat(lines, "\n"))
 		end
@@ -490,7 +552,6 @@ end
 function M.send_prompt()
 	local prompt
 
-	-- Get the visual selection or selected line
 	local lines = get_visual_selection()
 
 	if lines then
@@ -499,25 +560,73 @@ function M.send_prompt()
 		prompt = vim.api.nvim_get_current_line()
 	end
 
-	-- Exit visual mode
 	vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
-
-	-- Move to the end of the buffer
-	local last_line = vim.api.nvim_buf_line_count(0)
-	local last_line_length = #vim.api.nvim_buf_get_lines(0, last_line - 1, last_line, false)[1]
-	vim.api.nvim_win_set_cursor(0, { last_line, last_line_length })
 
 	local success, err = pcall(function()
 		if prompt and prompt ~= "" then
-			write_to_buffer("\n\n")
+			table.insert(conversation_history, {
+				role = "prompt",
+				content = prompt,
+			})
+
+			local current_response_index = #conversation_history + 1
+			conversation_history[current_response_index] = {
+				role = "response",
+				content = "",
+			}
+
+			local context = build_context_from_history()
+			local system_tokens = estimate_token_count(M.config.system_prompt)
+			local context_tokens = estimate_token_count(context)
+			local prompt_tokens = estimate_token_count(prompt)
+			local total_tokens = system_tokens + context_tokens + prompt_tokens
+
+			vim.notify(
+				string.format(
+					"Estimated tokens: ~%d (system: %d, context: %d, prompt: %d)",
+					total_tokens,
+					system_tokens,
+					context_tokens,
+					prompt_tokens
+				),
+				vim.log.levels.INFO
+			)
+
+			vim.schedule(function()
+				local buf = vim.api.nvim_get_current_buf()
+
+				local last_line = vim.api.nvim_buf_line_count(buf)
+
+				local last_line_content = vim.api.nvim_buf_get_lines(buf, last_line - 1, last_line, false)[1]
+
+				if last_line_content and #last_line_content > 0 then
+					vim.api.nvim_buf_set_lines(buf, last_line, last_line, false, { "", "" })
+					last_line = last_line + 2
+				else
+					vim.api.nvim_buf_set_lines(buf, last_line, last_line, false, { "" })
+					last_line = last_line + 1
+				end
+
+				vim.api.nvim_win_set_cursor(0, { last_line, 0 })
+			end)
+
+			local response_collector = ""
+			local function collect_response(text)
+				if text and #text > 0 then
+					response_collector = response_collector .. text
+					conversation_history[current_response_index].content = response_collector
+					write_to_buffer(text)
+				end
+			end
+
 			if M.config.provider == "anthropic" then
-				stream_anthropic_response(prompt)
+				stream_anthropic_response(prompt, collect_response)
 			elseif M.config.provider == "openai" then
-				stream_openai_response(prompt)
+				stream_openai_response(prompt, collect_response)
 			elseif M.config.provider == "gemini" then
-				stream_gemini_response(prompt)
+				stream_gemini_response(prompt, collect_response)
 			elseif M.config.provider == "ollama" then
-				stream_ollama_response(prompt)
+				stream_ollama_response(prompt, collect_response)
 			end
 		else
 			vim.notify("No prompt found. Ensure you have a valid selection or line selected.", vim.log.levels.ERROR)
@@ -529,12 +638,10 @@ function M.send_prompt()
 	end
 end
 
--- Setup function to create keymaps
 ---@param opts? LLMBufferConfig
 function M.setup(opts)
 	M.config = vim.tbl_deep_extend("force", M.defaults, opts or {})
 
-	-- Set window options
 	win_width = math.floor(vim.o.columns * M.config.window_width)
 	win_height = math.floor(vim.o.lines * M.config.window_height)
 	win_row = math.floor((vim.o.lines - win_height) / 2)
@@ -554,39 +661,38 @@ function M.setup(opts)
 		border = "rounded",
 	}
 
-	-- Create the LLMBuffer command
 	vim.api.nvim_create_user_command("LLMBuffer", function()
 		M.toggle_window()
 	end, {})
 
-	-- Set up the global keybinding
 	vim.keymap.set({ "n", "v" }, M.config.mappings.toggle_window, function()
 		M.toggle_window()
-	end, { noremap = true, silent = true, desc = "Toggle LLM Buffer" })
+	end, {
+		noremap = true,
+		silent = true,
+		desc = "Toggle LLM Buffer",
+	})
 
-	-- If the buffer is open before exiting Neovim, close it (helps with session management)
 	vim.api.nvim_create_autocmd("VimLeavePre", {
 		callback = function()
 			if llm_buf and vim.api.nvim_buf_is_valid(llm_buf) then
-				vim.api.nvim_buf_delete(llm_buf, { force = true })
+				vim.api.nvim_buf_delete(llm_buf, {
+					force = true,
+				})
 			end
 		end,
 	})
 end
 
--- Function to update options during runtime
 ---@param opts? LLMBufferConfig
 function M.update_options(opts)
 	if opts then
-		-- Update the configuration
 		M.config = vim.tbl_deep_extend("force", M.defaults, opts)
 
-		-- Update the window footer to show the new provider and model
 		M.win_opts = vim.tbl_deep_extend("force", M.win_opts, {
 			footer = "  " .. M.config.provider .. "/" .. M.config.model .. "  ",
 		})
 
-		-- If the window is visible, update the footer
 		if llm_win and vim.api.nvim_win_is_valid(llm_win) then
 			vim.api.nvim_win_set_config(llm_win, {
 				footer = "  " .. M.config.provider .. "/" .. M.config.model .. "  ",
